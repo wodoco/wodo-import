@@ -1009,3 +1009,30 @@ pub mod linear_fetch;
 
 /// Fetch a Jira project over REST and package it as an import-wizard ZIP.
 pub mod jira_fetch;
+
+/// Truncate `s` to at most `n` bytes for inclusion in an error/log message,
+/// appending `…` when shortened. Backs up to a UTF-8 char boundary first, so a
+/// non-ASCII byte at offset `n` (accented text or an emoji in an error body)
+/// can't split a multibyte sequence and panic. Shared by the fetchers.
+pub(crate) fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut end = n;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate;
+
+    #[test]
+    fn truncate_backs_up_to_char_boundary() {
+        assert_eq!(truncate("hello", 10), "hello"); // within limit → unchanged
+        assert_eq!(truncate("é", 1), "…"); // byte 1 splits é → back up to 0
+        assert_eq!(truncate("a😀b", 2), "a…"); // byte 2 splits the emoji → "a"
+    }
+}

@@ -17,4 +17,5 @@ wodo-interop = { path = "../wodo-interop" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 anyhow = "1.0"

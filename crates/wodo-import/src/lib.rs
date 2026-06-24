@@ -79,36 +79,48 @@ pub async fn run(opts: RunOpts) -> Result<()> {
         }
     };
 
-    let output = run_linear_import(&api_key, &fetch_opts, &resume, checkpoint)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    println!("{}", output.summary);
-    if !output.warnings.is_empty() {
-        eprintln!("\n{} warning(s):", output.warnings.len());
-        for w in &output.warnings {
-            eprintln!("  - {w}");
-        }
-    }
-
-    if opts.dry_run {
-        println!(
-            "\nDry run: fetched and converted {} bytes of ZIP (not written).",
-            output.zip.len()
-        );
-        return Ok(());
-    }
-
+    let client = http_client()?;
     let out_path = opts
         .out
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{}-export.zip", opts.team)));
-    std::fs::write(&out_path, &output.zip)
-        .with_context(|| format!("writing {}", out_path.display()))?;
+
+    // Dry run: stream into an in-memory buffer and discard it (no file written).
+    if opts.dry_run {
+        let output = run_linear_import(
+            &client,
+            std::io::Cursor::new(Vec::new()),
+            &api_key,
+            &fetch_opts,
+            &resume,
+            checkpoint,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{}", output.summary);
+        print_warnings(&output.warnings);
+        println!(
+            "\nDry run: fetched and converted {} bytes of ZIP (not written).",
+            output.bytes_written
+        );
+        return Ok(());
+    }
+
+    // Stream the archive straight to disk — never holds the whole ZIP in memory.
+    let sink = std::io::BufWriter::new(
+        std::fs::File::create(&out_path)
+            .with_context(|| format!("creating {}", out_path.display()))?,
+    );
+    let output = run_linear_import(&client, sink, &api_key, &fetch_opts, &resume, checkpoint)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    println!("{}", output.summary);
+    print_warnings(&output.warnings);
     println!(
         "\nWrote {} ({} bytes)",
         out_path.display(),
-        output.zip.len()
+        output.bytes_written
     );
 
     // A completed run's cursors are stale; leave them for the user to inspect
@@ -175,39 +187,77 @@ pub async fn run_jira(opts: JiraRunOpts) -> Result<()> {
         }
     };
 
-    let output = run_jira_import(&email, &api_token, &fetch_opts, &resume, checkpoint)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    println!("{}", output.summary);
-    if !output.warnings.is_empty() {
-        eprintln!("\n{} warning(s):", output.warnings.len());
-        for w in &output.warnings {
-            eprintln!("  - {w}");
-        }
-    }
-
-    if opts.dry_run {
-        println!(
-            "\nDry run: fetched and converted {} bytes of ZIP (not written).",
-            output.zip.len()
-        );
-        return Ok(());
-    }
-
+    let client = http_client()?;
     let out_path = opts
         .out
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{}-export.zip", opts.project)));
-    std::fs::write(&out_path, &output.zip)
-        .with_context(|| format!("writing {}", out_path.display()))?;
+
+    if opts.dry_run {
+        let output = run_jira_import(
+            &client,
+            std::io::Cursor::new(Vec::new()),
+            &email,
+            &api_token,
+            &fetch_opts,
+            &resume,
+            checkpoint,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{}", output.summary);
+        print_warnings(&output.warnings);
+        println!(
+            "\nDry run: fetched and converted {} bytes of ZIP (not written).",
+            output.bytes_written
+        );
+        return Ok(());
+    }
+
+    let sink = std::io::BufWriter::new(
+        std::fs::File::create(&out_path)
+            .with_context(|| format!("creating {}", out_path.display()))?,
+    );
+    let output = run_jira_import(
+        &client,
+        sink,
+        &email,
+        &api_token,
+        &fetch_opts,
+        &resume,
+        checkpoint,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    println!("{}", output.summary);
+    print_warnings(&output.warnings);
     println!(
         "\nWrote {} ({} bytes)",
         out_path.display(),
-        output.zip.len()
+        output.bytes_written
     );
 
     Ok(())
+}
+
+/// Shared HTTP client. A connect timeout avoids hanging forever on a dead host;
+/// downloads themselves are left untimed (attachments can be large + slow).
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("building HTTP client")
+}
+
+/// Print non-fatal warnings to stderr, if any.
+fn print_warnings(warnings: &[String]) {
+    if !warnings.is_empty() {
+        eprintln!("\n{} warning(s):", warnings.len());
+        for w in warnings {
+            eprintln!("  - {w}");
+        }
+    }
 }
 
 fn state_path(dir: &std::path::Path) -> PathBuf {

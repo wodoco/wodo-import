@@ -24,7 +24,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::export::package::write_space_export_zip;
+use super::truncate;
+use crate::export::package::SpaceExportZip;
 use crate::import::convert::linear::{
     self, LinearComment, LinearCycle, LinearDocument, LinearIssue, LinearLabelRef, LinearProject,
     LinearRelation, LinearTeam, LinearUser, LinearWorkflowState, LinearWorkspace,
@@ -60,10 +61,11 @@ impl Default for LinearImportOptions {
     }
 }
 
-/// Result of a successful import run.
+/// Result of a successful import run. The archive itself was streamed into the
+/// caller-provided sink; this carries only the run's metadata.
 pub struct LinearImportOutput {
-    /// The import-wizard ZIP (`data.json` + `attachments/…`).
-    pub zip: Vec<u8>,
+    /// Total bytes written to the sink (the archive size).
+    pub bytes_written: u64,
     /// Non-fatal fidelity/transfer warnings (converter + attachment downloads).
     pub warnings: Vec<String>,
     /// Human-readable per-stream counts + attachments-downloaded summary.
@@ -407,14 +409,6 @@ fn parse_rate_headers(
     )
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
-    }
-}
-
 /// One paginated connection page extracted from a GraphQL `data` object.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -446,7 +440,9 @@ struct PageInfo {
 /// `resume` maps `stream name → last end cursor` to continue an interrupted
 /// run; `checkpoint(stream, cursor)` is invoked after every page so the caller
 /// can persist progress.
-pub async fn run_linear_import(
+pub async fn run_linear_import<W: std::io::Write + std::io::Seek + Send>(
+    client: &reqwest::Client,
+    sink: W,
     api_key: &str,
     opts: &LinearImportOptions,
     resume: &HashMap<String, String>,
@@ -457,10 +453,9 @@ pub async fn run_linear_import(
     } else {
         opts.base_url.as_str()
     };
-    let client = reqwest::Client::new();
 
     // ── Team meta (single object, not paginated) ──────────────────────────────
-    let team = fetch_team(&client, base_url, api_key, &opts.team_key).await?;
+    let team = fetch_team(client, base_url, api_key, &opts.team_key).await?;
 
     // ── Each flat stream, paginated + resumable + auto-tuned ──────────────────
     let mut raw: HashMap<&'static str, Vec<Value>> = HashMap::new();
@@ -473,7 +468,7 @@ pub async fn run_linear_import(
             // Throttle ahead of the call based on the last page's headers.
             // (The first call has no headers yet ⇒ no sleep.)
             let page = gql(
-                &client,
+                client,
                 base_url,
                 api_key,
                 &stream.query,
@@ -568,7 +563,7 @@ pub async fn run_linear_import(
     let issue_relations: Vec<LinearRelation> = decode_values(relations_in, "issueRelations")?;
 
     // ── Fill in label defs referenced by issues but absent from the stream ────
-    fetch_missing_labels(&client, base_url, api_key, &issues, &mut issue_labels).await?;
+    fetch_missing_labels(client, base_url, api_key, &issues, &mut issue_labels).await?;
 
     let ws = LinearWorkspace {
         team,
@@ -610,16 +605,18 @@ pub async fn run_linear_import(
         .map(|a| (a.id.clone(), a.filename.clone()))
         .collect();
 
-    let mut blobs: Vec<(String, String, Vec<u8>)> = Vec::new();
+    let mut zw = SpaceExportZip::new(sink);
+    let mut size_by_att: HashMap<String, usize> = HashMap::new();
     let mut downloaded = 0usize;
     for (att_id, url) in &conversion.attachment_urls {
         let Some(filename) = filename_by_att.get(att_id.as_str()) else {
             warnings.push(format!("attachment {att_id}: no manifest entry; skipped"));
             continue;
         };
-        match download_attachment(&client, api_key, url).await {
+        match download_attachment(client, api_key, url).await {
             Ok(bytes) => {
-                blobs.push((att_id.clone(), filename.clone(), bytes));
+                size_by_att.insert(att_id.clone(), bytes.len());
+                zw.add_attachment(att_id, filename, &bytes)?;
                 downloaded += 1;
             }
             Err(e) => warnings.push(format!("attachment {att_id} ({url}): download failed: {e}")),
@@ -628,22 +625,19 @@ pub async fn run_linear_import(
 
     // Backfill each attachment's real size from the downloaded bytes (the
     // converter leaves a `0` placeholder, which otherwise shows as "0 B" in the
-    // import preview). Match by attachment id.
-    let size_by_att: HashMap<&str, usize> = blobs
-        .iter()
-        .map(|(id, _, bytes)| (id.as_str(), bytes.len()))
-        .collect();
+    // import preview). Match by attachment id. data.json is serialized in
+    // `finish` below — after this backfill — so the sizes land in the archive.
     for att in &mut export.attachments {
         if let Some(&size) = size_by_att.get(att.id.as_str()) {
             att.size_bytes = size as i64;
         }
     }
 
-    let zip = write_space_export_zip(&export, &blobs)?;
+    let bytes_written = zw.finish(&export)?;
     let summary = counts.render(&export, downloaded);
 
     Ok(LinearImportOutput {
-        zip,
+        bytes_written,
         warnings,
         summary,
     })

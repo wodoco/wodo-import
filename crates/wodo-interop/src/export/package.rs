@@ -13,42 +13,94 @@
 //! / deflate layout); it exists here so the Linear importer can build a valid
 //! archive without depending on the admin crate.
 
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Seek, SeekFrom, Write};
 
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use crate::export::types::SpaceExport;
 
-/// Write a SpaceExport plus its attachment blobs into a deflate ZIP archive.
+/// Streaming writer for the import-wizard ZIP.
 ///
-/// `attachments` is `(att_id, filename, bytes)`; each becomes the entry
-/// `attachments/{att_id}/{filename}`. `data.json` holds the serialized export.
-/// Returns the in-memory ZIP bytes.
+/// Attachments are added one at a time and written straight through to the
+/// caller-provided sink `W`, so the whole archive never lives in memory — only
+/// one blob at a time. `W` is the injected destination: a local file for the
+/// CLI, an S3-staging sink on the server. `data.json` is written **last**
+/// (in [`finish`](Self::finish)) so the caller can backfill the export — e.g.
+/// real attachment sizes learned during download — before it's serialized; ZIP
+/// entry order is irrelevant to readers, which use the central directory.
+pub struct SpaceExportZip<W: Write + Seek> {
+    zip: ZipWriter<W>,
+    options: SimpleFileOptions,
+}
+
+impl<W: Write + Seek> SpaceExportZip<W> {
+    /// Open the archive over `writer`. The sink must be **seekable**: the ZIP
+    /// format patches each local header with sizes/CRC after the entry data, so
+    /// `ZipWriter` seeks back over it. A local file satisfies this directly; a
+    /// non-seekable target (e.g. S3 multipart) is fed via a temp-file-backed
+    /// handle.
+    pub fn new(writer: W) -> Self {
+        Self {
+            zip: ZipWriter::new(writer),
+            options: SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+        }
+    }
+
+    /// Stream one attachment blob into `attachments/{att_id}/{filename}`.
+    pub fn add_attachment(
+        &mut self,
+        att_id: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let entry = format!("attachments/{att_id}/{filename}");
+        self.zip
+            .start_file(&entry, self.options)
+            .map_err(|e| format!("start {entry}: {e}"))?;
+        self.zip
+            .write_all(bytes)
+            .map_err(|e| format!("write {entry}: {e}"))?;
+        Ok(())
+    }
+
+    /// Write `data.json` (the serialized export) and close the archive.
+    /// Returns the archive size in bytes.
+    pub fn finish(mut self, export: &SpaceExport) -> Result<u64, String> {
+        let json =
+            serde_json::to_vec_pretty(export).map_err(|e| format!("serialize export: {e}"))?;
+        self.zip
+            .start_file("data.json", self.options)
+            .map_err(|e| format!("start data.json: {e}"))?;
+        self.zip
+            .write_all(&json)
+            .map_err(|e| format!("write data.json: {e}"))?;
+        let mut writer = self.zip.finish().map_err(|e| format!("finish zip: {e}"))?;
+        writer.flush().map_err(|e| format!("flush zip: {e}"))?;
+        // Archive size = final stream length (robust to ZipWriter's header
+        // seek-backs, which a byte counter would over-count).
+        writer
+            .seek(SeekFrom::End(0))
+            .map_err(|e| format!("size zip: {e}"))
+    }
+}
+
+/// Convenience: build the whole archive in memory and return its bytes. Prefer
+/// [`SpaceExportZip`] for large or streamed exports; this is for small exports
+/// and tests.
 pub fn write_space_export_zip(
     export: &SpaceExport,
     attachments: &[(String, String, Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
-    let json = serde_json::to_vec_pretty(export).map_err(|e| format!("serialize export: {e}"))?;
-
-    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-
-    zip.start_file("data.json", options)
-        .map_err(|e| format!("start data.json: {e}"))?;
-    zip.write_all(&json)
-        .map_err(|e| format!("write data.json: {e}"))?;
-
-    for (att_id, filename, bytes) in attachments {
-        let entry = format!("attachments/{att_id}/{filename}");
-        zip.start_file(&entry, options)
-            .map_err(|e| format!("start {entry}: {e}"))?;
-        zip.write_all(bytes)
-            .map_err(|e| format!("write {entry}: {e}"))?;
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut zw = SpaceExportZip::new(&mut buf);
+        for (att_id, filename, bytes) in attachments {
+            zw.add_attachment(att_id, filename, bytes)?;
+        }
+        zw.finish(export)?;
     }
-
-    let cursor = zip.finish().map_err(|e| format!("finish zip: {e}"))?;
-    Ok(cursor.into_inner())
+    Ok(buf.into_inner())
 }
 
 #[cfg(test)]

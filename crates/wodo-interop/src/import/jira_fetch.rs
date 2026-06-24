@@ -23,7 +23,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::export::package::write_space_export_zip;
+use super::truncate;
+use crate::export::package::SpaceExportZip;
 use crate::import::convert::jira::{self, JiraIssue, JiraProject};
 
 /// Default page size for the issue search before any override.
@@ -40,10 +41,11 @@ pub struct JiraImportOptions {
     pub page_size: usize,
 }
 
-/// Result of a successful import run.
+/// Result of a successful import run. The archive itself was streamed into the
+/// caller-provided sink; this carries only the run's metadata.
 pub struct JiraImportOutput {
-    /// The import-wizard ZIP (`data.json` + `attachments/…`).
-    pub zip: Vec<u8>,
+    /// Total bytes written to the sink (the archive size).
+    pub bytes_written: u64,
     /// Non-fatal fidelity/transfer warnings (converter + attachment downloads).
     pub warnings: Vec<String>,
     /// Human-readable summary (issue count, attachments downloaded, warnings).
@@ -100,14 +102,6 @@ impl SearchPage {
     /// Whether the pagination loop should stop after this page.
     fn done(&self) -> bool {
         self.is_last || self.next_page_token.as_deref().unwrap_or("").is_empty()
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
     }
 }
 
@@ -239,7 +233,9 @@ async fn download_attachment(
 /// after every page so the caller can persist progress. (Jira page tokens can be
 /// short-lived, so resume is best-effort — a stale token simply restarts the
 /// search from the beginning on the next run.)
-pub async fn run_jira_import(
+pub async fn run_jira_import<W: std::io::Write + std::io::Seek + Send>(
+    client: &reqwest::Client,
+    sink: W,
     email: &str,
     api_token: &str,
     opts: &JiraImportOptions,
@@ -248,7 +244,6 @@ pub async fn run_jira_import(
 ) -> Result<JiraImportOutput, String> {
     let base_url = base(opts).to_string();
     let page_size = opts.page_size.max(1);
-    let client = reqwest::Client::new();
 
     // ── Issues: one denormalized, token-paginated stream ──────────────────────
     let mut issue_values: Vec<Value> = Vec::new();
@@ -256,7 +251,7 @@ pub async fn run_jira_import(
 
     loop {
         let page = search_page(
-            &client,
+            client,
             &base_url,
             email,
             api_token,
@@ -296,7 +291,7 @@ pub async fn run_jira_import(
 
     // ── Project meta: prefer the REST project endpoint, fall back to the first
     //    issue's embedded `fields.project` ─────────────────────────────────────
-    let project = match fetch_project(&client, &base_url, email, api_token, &opts.project_key).await
+    let project = match fetch_project(client, &base_url, email, api_token, &opts.project_key).await
     {
         Ok(p) => p,
         Err(e) => issues
@@ -319,16 +314,16 @@ pub async fn run_jira_import(
         .collect();
 
     // ── Download attachment bytes (warn-and-skip on failure) ──────────────────
-    let mut blobs: Vec<(String, String, Vec<u8>)> = Vec::new();
+    let mut zw = SpaceExportZip::new(sink);
     let mut downloaded = 0usize;
     for (att_id, url) in &conv.attachment_urls {
         let Some(&filename) = filename_by_att.get(att_id.as_str()) else {
             warnings.push(format!("attachment {att_id}: no manifest entry; skipped"));
             continue;
         };
-        match download_attachment(&client, email, api_token, url).await {
+        match download_attachment(client, email, api_token, url).await {
             Ok(bytes) => {
-                blobs.push((att_id.clone(), filename.to_string(), bytes));
+                zw.add_attachment(att_id, filename, &bytes)?;
                 downloaded += 1;
             }
             Err(e) => warnings.push(format!("attachment {att_id} ({url}): download failed: {e}")),
@@ -336,7 +331,7 @@ pub async fn run_jira_import(
     }
 
     // Jira already supplied size/mime, so no size backfill is needed.
-    let zip = write_space_export_zip(&export, &blobs)?;
+    let bytes_written = zw.finish(&export)?;
     let summary = format!(
         "Jira import summary:\n\
          \x20 project:         {} ({})\n\
@@ -354,7 +349,7 @@ pub async fn run_jira_import(
     );
 
     Ok(JiraImportOutput {
-        zip,
+        bytes_written,
         warnings,
         summary,
     })
