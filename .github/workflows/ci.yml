@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # Lint shipping code (lib + bins). Test code is exercised by `cargo test`
+      # below rather than clippy-gated, to keep test authoring low-friction.
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo build --locked --release
+      - run: cargo test --locked --release

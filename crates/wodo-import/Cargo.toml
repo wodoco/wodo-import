@@ -1,0 +1,20 @@
+[package]
+name = "wodo-import"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "wodo-import"
+path = "src/main.rs"
+
+[lib]
+name = "wodo_import"
+path = "src/lib.rs"
+
+[dependencies]
+wodo-interop = { path = "../wodo-interop" }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = "1.0"
