@@ -15,8 +15,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-darwin,   os: macos-14,       archive: tar.gz }  # Apple Silicon
-          - { target: x86_64-pc-windows-msvc, os: windows-latest, archive: zip }
+          - { target: aarch64-apple-darwin,        os: macos-14,        archive: tar.gz }  # Apple Silicon
+          - { target: x86_64-pc-windows-msvc,      os: windows-latest,  archive: zip }
+          - { target: x86_64-unknown-linux-musl,   os: ubuntu-22.04,    archive: tar.gz }  # static, runs on any x86-64 Linux
+          - { target: aarch64-unknown-linux-musl,  os: ubuntu-22.04-arm, archive: tar.gz } # static, runs on any arm64 Linux
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,6 +27,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # musl targets need musl-gcc (the `cc`/ring build picks it up automatically).
+      - name: Install musl tools
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }} -p wodo-import
 
       - name: Package (unix)

@@ -34,10 +34,6 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
 
-        /// Directory for resume cursors (cursors.json); enables crash-resume.
-        #[arg(long = "state-dir")]
-        state_dir: Option<PathBuf>,
-
         /// Fetch + convert + report, but don't write the ZIP.
         #[arg(long)]
         dry_run: bool,
@@ -76,10 +72,6 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
 
-        /// Directory for the resume token (jira-cursors.json); enables crash-resume.
-        #[arg(long = "state-dir")]
-        state_dir: Option<PathBuf>,
-
         /// Fetch + convert + report, but don't write the ZIP.
         #[arg(long)]
         dry_run: bool,
@@ -97,7 +89,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Linear {
             team,
             out,
-            state_dir,
             dry_run,
             seed_page_size,
             complexity_target,
@@ -107,7 +98,6 @@ async fn main() -> anyhow::Result<()> {
             wodo_import::run(RunOpts {
                 team,
                 out,
-                state_dir,
                 dry_run,
                 seed_page_size,
                 complexity_target,
@@ -120,7 +110,6 @@ async fn main() -> anyhow::Result<()> {
             project,
             base_url,
             out,
-            state_dir,
             dry_run,
             page_size,
         } => {
@@ -128,7 +117,6 @@ async fn main() -> anyhow::Result<()> {
                 project,
                 base_url,
                 out,
-                state_dir,
                 dry_run,
                 page_size,
             })
