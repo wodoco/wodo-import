@@ -47,7 +47,6 @@ wodo-import linear --team WMT          # → WMT-export.zip
 |------|---------|
 | `--team` (required) | Linear team key, e.g. `WMT` |
 | `--out` | Output path (default `{team}-export.zip`) |
-| `--state-dir` | Directory for resume cursors — enables crash-resume |
 | `--dry-run` | Fetch + convert + report, but don't write the ZIP |
 | `--seed-page-size` | First GraphQL page size before auto-tuning (default 10) |
 | `--complexity-target` | Target per-page GraphQL complexity (default 8000) |
